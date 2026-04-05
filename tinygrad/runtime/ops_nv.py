@@ -29,6 +29,13 @@ class NVSignal(HCQSignal):
     # Reasonable to sleep for long workloads (which take more than 200ms) and only timeline signals.
     if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
 
+  def wait(self, value:int, timeout:int|None=None):
+    # On eGPU, ring entries are staged without firing the doorbell so multiple submissions can be
+    # coalesced into a single Thunderbolt round-trip.  Before the CPU blocks, we must fire all
+    # pending doorbells or the GPU will never make progress and we'd deadlock.
+    if self.owner is not None and self.owner.is_egpu: self.owner.flush_submissions()
+    super().wait(value, timeout=timeout)
+
 def get_error_str(status): return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
 
 NV_PFAULT_FAULT_TYPE = {dt:name for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_FAULT_TYPE_")}
@@ -118,13 +125,16 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
       cmdq_wptr = (cmdq_addr - dev.cmdq_page.va_addr) // 4
       dev.cmdq[cmdq_wptr : cmdq_wptr + len(self._q)] = array.array('I', self._q)
 
+    # Stage the ring entry.  This is a write-combined write into GPU memory — cheap even over
+    # Thunderbolt because the CPU's WC buffer coalesces sequential 8-byte stores into one TLP.
     gpfifo.ring[gpfifo.put_value % gpfifo.entries_count] = (cmdq_addr//4 << 2) | (len(self._q) << 42) | (1 << 41)
-    gpfifo.gpput[0] = (gpfifo.put_value + 1) % gpfifo.entries_count
-    if getattr(getattr(dev.iface, 'dev_impl', None), 'is_egpu', False): _ = gpfifo.gpput[0]  # flush BAR1 writes before doorbell
-
-    System.memory_barrier()
-    dev.gpu_mmio[0x90 // 4] = gpfifo.token
     gpfifo.put_value += 1
+    gpfifo.pending_entries += 1
+
+    # On eGPU (Thunderbolt), every MMIO write (gpput + doorbell) costs ~1.5 µs.  Defer both until
+    # flush_submissions() is called so that a burst of N kernel launches pays only one round-trip
+    # instead of N.  For PCIe-attached GPUs the overhead is negligible — flush immediately.
+    if not dev.is_egpu: dev._flush_gpfifo(gpfifo)
 
 class NVComputeQueue(NVCommandQueue):
   def memory_barrier(self):
@@ -365,6 +375,7 @@ class GPFifo:
   entries_count: int
   token: int
   put_value: int = 0
+  pending_entries: int = 0  # ring entries staged but not yet signalled via gpput+doorbell
 
 class NVKIface:
   root = None
@@ -576,6 +587,37 @@ class PCIIface(PCIIfaceBase):
 
 class NVDevice(HCQCompiled[NVSignal]):
   def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
+
+  @property
+  def is_egpu(self) -> bool:
+    """True when the GPU is connected via Thunderbolt (eGPU). Each MMIO write costs ~1.5 µs."""
+    return getattr(getattr(self.iface, 'dev_impl', None), 'is_egpu', False)
+
+  def _flush_gpfifo(self, gpfifo:GPFifo):
+    """Advance gpput and ring the doorbell for all staged-but-unfired ring entries on one GPFIFO."""
+    if gpfifo.pending_entries == 0: return
+    # gpput tells the GPU how far the ring has been filled.  One BAR1 write, one doorbell write.
+    gpfifo.gpput[0] = gpfifo.put_value % gpfifo.entries_count
+    if self.is_egpu: _ = gpfifo.gpput[0]  # read-back flushes the PCIe write buffer on Thunderbolt
+    System.memory_barrier()
+    self.gpu_mmio[0x90 // 4] = gpfifo.token  # doorbell: wake the GPU channel
+    gpfifo.pending_entries = 0
+
+  def flush_submissions(self):
+    """Fire all pending batched GPFIFO doorbells.
+
+    On eGPU, _submit_to_gpfifo stages ring entries without firing the doorbell so that N kernel
+    launches in one Python burst collapse to a single Thunderbolt round-trip.  Call this before
+    any CPU-side wait on a GPU signal (synchronize, signal.wait, etc.) or the GPU will stall.
+    """
+    self._flush_gpfifo(self.compute_gpfifo)
+    self._flush_gpfifo(self.dma_gpfifo)
+    if hasattr(self, 'vid_gpfifo'): self._flush_gpfifo(self.vid_gpfifo)
+
+  def synchronize(self, timeout:int|None=None):
+    # Ensure all deferred eGPU doorbells are fired before the CPU blocks on the timeline signal.
+    self.flush_submissions()
+    super().synchronize(timeout=timeout)
 
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
