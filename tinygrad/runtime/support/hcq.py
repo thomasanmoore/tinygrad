@@ -603,12 +603,27 @@ class HCQAllocator(HCQAllocatorBase, Generic[HCQDeviceType]):
 
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"{self.dev.device} -> TINY", ret=dest.nbytes), enabled=PROFILE,
                      dev_suff="SDMA:0"):
-      for i in range(0, dest.nbytes, cp_size:=(self.max_copyout_size or self.b[0].size)):
+      cp_size = self.max_copyout_size or self.b[0].size
+      b_curr, prev = 0, None  # prev = (buf_idx, dest_offset, chunk_size)
+      for i in range(0, dest.nbytes, cp_size):
+        lsize = min(cp_size, dest.nbytes - i)
+        # Submit DMA for this chunk into b[b_curr] (in flight while we drain the previous one).
         self.dev.hw_copy_queue_t().wait(self.dev.timeline_signal, self.dev.timeline_value - 1) \
-                                  .copy(self.b[0], src.offset(i), lsize:=min(cp_size, dest.nbytes-i)) \
+                                  .copy(self.b[b_curr], src.offset(i), lsize) \
                                   .signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
-        self.dev.timeline_signal.wait(self.dev.timeline_value - 1)
-        dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
+        self.b_timeline[b_curr] = self.dev.timeline_value - 1
+        # Drain the previous chunk: wait for its DMA then CPU-copy it to dest.
+        if prev is not None:
+          pi, po, ps = prev
+          self.dev.timeline_signal.wait(self.b_timeline[pi])
+          dest.cast('B')[po:po+ps] = self.b[pi].cpu_view().view(size=ps, fmt='B')[:]
+        prev = (b_curr, i, lsize)
+        b_curr ^= 1  # ping-pong between buffer 0 and 1
+      # Drain the last in-flight chunk.
+      if prev is not None:
+        pi, po, ps = prev
+        self.dev.timeline_signal.wait(self.b_timeline[pi])
+        dest.cast('B')[po:po+ps] = self.b[pi].cpu_view().view(size=ps, fmt='B')[:]
 
   def _transfer(self, dest:HCQBuffer, src:HCQBuffer, sz:int, src_dev:HCQDeviceType, dest_dev:HCQDeviceType):
     if src_dev.peer_group != dest_dev.peer_group: return src_dev.rdma_dev().allocator._transfer(dest, src, sz, src_dev, dest_dev)
